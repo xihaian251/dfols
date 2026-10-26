@@ -1,13 +1,20 @@
-# Regression tests for the coordinate frame used by the regularised S-FISTA subproblem
-# (dfols/trust_region.py::ctrsbox_sfista).
+# Regression tests for the coordinate frames used by the regularised S-FISTA subproblem
+# (dfols/trust_region.py::ctrsbox_sfista and its two pbox call sites in dfols/controller.py).
 #
-# With scaling_changes set, h and prox_uh act on the original (unscaled) coordinates while
-# the iterate d lives in the internally scaled coordinates.  The smoothed gradient must
-# therefore carry the chain-rule factor scale, and the gradient's Lipschitz constant is
-# ||H||_2 + max(scale**2)/u.
+# Defect A (scaled gradient): with scaling_changes set, h and prox_uh act on the original
+#   (unscaled) coordinates while the iterate d lives in the internally scaled coordinates.
+#   The smoothed gradient must therefore carry the chain-rule factor scale, and the
+#   gradient's Lipschitz constant is ||H||_2 + max(scale**2)/u.
+# Defect B (box frame): Model.sl/su are bounds *relative to Model.xbase*, but the S-FISTA
+#   receives the *absolute* xopt and applies the box to xopt + d, so the box must be shifted
+#   back into absolute coordinates.
 #
-# TestScaledGradient and TestScaledStepSize fail on 89ac51b and pass on the patched code;
-# TestScaledStepSize also fails if only the gradient formula is fixed.
+# TestScaledGradient and TestCriticalityBoxFrame are the two defect tests; they fail on
+#   89ac51b with the wrong gradient / the wrong box and pass on the patched code.
+# TestScaledStepSize additionally pins the Lipschitz constant, so it still fails on a
+#   partial fix that only corrects the gradient formula.
+# TestTrustRegionBoxFrame covers the second pbox call site (controller.py:586), so the
+#   suite also fails on a partial fix that only corrects evaluate_criticality_measure.
 # TestScaledGradientUnscaledControl passes on every tree and guards against over-correcting
 #   the unscaled path.
 from __future__ import absolute_import, division, print_function, unicode_literals
@@ -125,3 +132,79 @@ class TestScaledStepSize(unittest.TestCase):
         self.assertLessEqual(lhs, rhs * (1.0 + 1e-12),
                              "step is longer than grad/L allows: ||d||*L=%r > ||grad||=%r"
                              % (lhs, rhs))
+
+
+class _FakeModel(object):
+    projections = []
+
+    def __init__(self, xopt, g, H):
+        self._x = np.array(xopt, dtype=float)
+        self._g = np.array(g, dtype=float)
+        self._H = np.array(H, dtype=float)
+        self.sl = -1e20 * np.ones(self._x.size)
+        self.su = 1e20 * np.ones(self._x.size)
+        self.xbase = np.zeros(self._x.size)
+
+    def build_full_model(self):
+        return self._g, self._H
+
+    def xopt(self, abs_coordinates=False):
+        return self._x
+
+
+class _FakeController(object):
+    """Duck-typed `self` for Controller.evaluate_criticality_measure."""
+
+    def __init__(self, xopt, g, H, h, lh, prox):
+        self.model = _FakeModel(xopt, g, H)
+        self.h = h
+        self.lh = lh
+        self.prox_uh = prox
+        self.argsh = ()
+        self.argsprox = ()
+        self.scaling_changes = None
+        self.delta = 1.0
+
+
+class TestCriticalityBoxFrame(unittest.TestCase):
+    """The criticality subproblem must be solved over the TRUE box, not a shifted one.
+
+    Analytic oracle (no reference to the implementation): n=1, xbase=0.5, sl/su=-0.5/0.5
+    (true box [0,1]), xopt=0.8, g=3, H=0, h=2|x|, delta=1.
+        m(d) = 3d + 2|0.8+d|,  d in [-0.8, 0.2] (true box)  ->  min at d=-0.8, m=-2.4,
+        eta_1 = h(xopt) - min m = 1.6 - (-2.4) = 4.0.
+    The shifted box [-0.5,0.5] instead allows d down to -1 (ball limited), m=-2.6, eta=4.2.
+    """
+
+    def runTest(self):
+        from dfols.controller import Controller
+        from dfols.params import ParameterList
+        params = ParameterList(1, 2, 300)
+        fake = _FakeController(np.array([0.8]), np.array([3.0]), np.zeros((1, 1)),
+                               lambda x: 2.0 * np.abs(x).sum(), 2.0, prox_l1_scaled(2.0))
+        fake.model.sl = np.array([-0.5])     # bounds relative to xbase, as Model stores them
+        fake.model.su = np.array([0.5])
+        fake.model.xbase = np.array([0.5])
+        eta = Controller.evaluate_criticality_measure(fake, params)
+        self.assertAlmostEqual(eta, 4.0, delta=1e-6,
+                               msg="criticality subproblem uses a shifted box: eta=%r, expected 4.0" % eta)
+
+
+class TestTrustRegionBoxFrame(unittest.TestCase):
+    """The trust-region S-FISTA call (controller.py:586 site) must use the TRUE box."""
+
+    def runTest(self):
+        from dfols.controller import Controller
+        from dfols.params import ParameterList
+        params = ParameterList(1, 2, 300)
+        fake = _FakeController(np.array([0.8]), np.array([3.0]), np.zeros((1, 1)),
+                               lambda x: 2.0 * np.abs(x).sum(), 2.0, prox_l1_scaled(2.0))
+        fake.model.sl = np.array([-0.5])
+        fake.model.su = np.array([0.5])
+        fake.model.xbase = np.array([0.5])
+        d, gopt, H, gnew, crvmin = Controller.trust_region_step(fake, params, 4.0)
+        x = np.array([0.8]) + np.asarray(d, dtype=float)
+        # the true box is [sl+xbase, su+xbase] = [0, 1]; d=0 is feasible, so the returned
+        # step must not leave it
+        self.assertTrue(np.all(x >= -1e-12) and np.all(x <= 1.0 + 1e-12),
+                        "trust-region step leaves the true box: x=%r" % x)
